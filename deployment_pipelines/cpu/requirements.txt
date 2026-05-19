@@ -1,0 +1,5 @@
+1) Raspberry Pi 5 deployment
+numpy==2.2.4
+opencv==4.10.0
+ncnn==1.0.20260114
+PyYAML==6.0.2
