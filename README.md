@@ -16,7 +16,7 @@
 
 ## deployment_pipelines
 
-- In this folder first we navigate to the exact deployment setting so we start with the host device we are using (for e.g., raspberry_pi_5) and the processor we will use to offload the inference computation (for e.g., cpu / npu).
+- In this folder first we navigate to the folder representing the processor on which we run the inference for e.g., cpu, npu, etc. Then we navigate to the folder representing the host device on which we are running the inference for e.g., raspberry pi 5.
 - Then inside each deployment setting we will have a setup.sh file to ensure relevant hardware settings to run the inference, we will have requirements.txt file to note down the necessary dependencies, we will have the inference code file named as (model_name)_(model_format)_inference.py and finally we wil have the readme.md file which will contain information about this particular deployment pipeline. 
 
 ## scripts
