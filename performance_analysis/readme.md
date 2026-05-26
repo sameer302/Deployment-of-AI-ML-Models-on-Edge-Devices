@@ -9,6 +9,14 @@
         `sudo cpufreq-set -g performance`
         - After changing, we can check the state of CPU governor using the following command:
         `cat /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor`
+	- Another option is to run the below commands
+	`cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_governors`
+	Then the below command,	
+	`for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+    		echo performance | sudo tee $cpu/cpufreq/scaling_governor
+	 done`
+	- After running above command we can verify using, 
+	`cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor`
 
     2) Memory / Cache state
         - Linux filesystem cache and RAM reuse affect timing.

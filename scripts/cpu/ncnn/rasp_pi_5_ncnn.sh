@@ -7,7 +7,9 @@ source venv/bin/activate
 # Examples: 7m (7 minutes), 30s (30 seconds), 2h (2 hours)
 TIME_DURATION="7m"
 
-# YOLOV11 inference using ncnn format (basic libraries)
+# Uncomment other inference scripts and run only the one you want to test. Make sure to update the model path and source as needed.
+
+# YOLOV11 inference using ncnn format
 # The script will run for the specified TIME_DURATION and then automatically stop
 timeout $TIME_DURATION python yolo11_ncnn_inference.py \
     --model /home/sameer/Desktop/Edge_AI/Deployment-of-AI-ML-Models-on-Edge-Devices/aiml_models/pre-built_models/vision/object_detection/cpu/yolo11n_ncnn_model \

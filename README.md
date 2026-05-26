@@ -2,9 +2,10 @@
 
 ## quick start guide
 
-- Navigate to the desired hardware deployment setting folder in the scripts folder.
-- Open the bash script (.sh) file and choose the appropriate inference instance and comment out the other examples. Read more about the inference instance from deployment_setting folder so you can modify the arguments as per need. 
-- Finally run the bash script using the command `bash ./file_name.sh`.
+- Clone the repo in your local folder.
+- Open the scripts folder, navigate inside to the deployment setting you want to execute.
+- Open the bash script and modify the arguments as per need or let them be as is. Refer to readme.md fo this particular deployment setting from the deployment_pipelines folder. 
+- Finally run the bash script using the command `bash run_inference.sh`.
 
 ## aiml_models
 
@@ -26,6 +27,7 @@
 - For each of these setting we then have a bash script which contains code to run inference for different scenarios as mentioned in the corresponding bash script. 
  
 ## Future Tasks
+- Add relative paths everywhere so that after cloning people don't face problem. 
 - Add more system baseline settings
 - Add more performance metrics to log
 - Add setup_env.sh to every deployment pipeline in which I shpuld mention about what exact hardware component to use with its specifications and operating mode. 
