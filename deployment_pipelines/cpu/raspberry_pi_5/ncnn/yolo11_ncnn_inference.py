@@ -15,6 +15,10 @@ Usage examples:
   python yolo_ncnn_infer.py --model yolo11n_ncnn_model --source picamera0 --resolution 640x480
   python yolo_ncnn_infer.py --model yolo11n_ncnn_model --source picamera0 --resolution 1280x720 --display 640x480
   python yolo_ncnn_infer.py --model yolo11n_ncnn_model --source usb0 --resolution 1280x720 --record
+
+  # With metrics logging:
+  python yolo_ncnn_infer.py --model yolo11n_ncnn_model --source usb0 --log-latency --log-inference-latency --log-fps --log-inference-fps --csv-path metrics.csv
+  python yolo_ncnn_infer.py --model yolo11n_ncnn_model --source usb0 --log-latency --csv-path /home/pi/logs/metrics.csv --frame-window-size 20
 """
 
 import os
@@ -22,11 +26,29 @@ import sys
 import argparse
 import glob
 import time
+import signal
+# ── METRICS: standard library imports for CSV writing and datetime formatting ──
+import csv
+import datetime
+from collections import deque
 
 import cv2
 import numpy as np
 import yaml
 import ncnn
+
+# ---------------------------------------------------------------------------
+# Graceful shutdown flag — set by SIGTERM (timeout) or SIGINT (Ctrl+C)
+# ---------------------------------------------------------------------------
+_shutdown_requested = False
+
+def _request_shutdown(signum, frame):
+    global _shutdown_requested
+    print(f'\n[INFO] Signal {signum} received. Shutting down gracefully...')
+    _shutdown_requested = True
+
+signal.signal(signal.SIGTERM, _request_shutdown)
+signal.signal(signal.SIGINT,  _request_shutdown)
 
 # ---------------------------------------------------------------------------
 # Argument parsing
@@ -48,6 +70,25 @@ parser.add_argument('--display',
                          '(optional — defaults to capture resolution if not set)')
 parser.add_argument('--record',     action='store_true',
                     help='Record output to demo1.avi  (requires --resolution)')
+
+# ── METRICS: five new arguments for controlling what gets logged and where ──
+parser.add_argument('--log-latency',          action='store_true',
+                    help='Log end-to-end frame latency (capture → display) to CSV')
+parser.add_argument('--log-inference-latency', action='store_true',
+                    help='Log pure inference latency (ncnn forward pass only) to CSV')
+parser.add_argument('--log-fps',              action='store_true',
+                    help='Log end-to-end FPS (rolling window) to CSV. '
+                         'Only valid for video/camera sources.')
+parser.add_argument('--log-inference-fps',    action='store_true',
+                    help='Log inference-only FPS (rolling window) to CSV. '
+                         'Only valid for video/camera sources.')
+parser.add_argument('--csv-path',             type=str, default=None,
+                    help='Path to the output CSV file, e.g. metrics.csv or /home/pi/logs/metrics.csv. '
+                         'Required if any --log-* flag is set.')
+parser.add_argument('--frame-window-size',          type=int, default=30,
+                    help='Rolling window size (number of frames) used to compute FPS. '
+                         'Default: 30')
+
 args = parser.parse_args()
 
 # ---------------------------------------------------------------------------
@@ -219,6 +260,23 @@ else:
     print(f'ERROR: Unrecognised source: {img_source}')
     sys.exit(1)
 
+# ── METRICS: warn user if FPS logging is requested on image/folder sources ──
+# FPS only makes sense for continuous streams; for static images it is meaningless.
+if source_type in ('image', 'folder'):
+    if args.log_fps or args.log_inference_fps:
+        print('[WARNING] --log-fps and --log-inference-fps are only valid for '
+              'video and live camera sources. These metrics will be skipped.')
+        # Force-disable the flags so the rest of the code doesn't try to log them
+        args.log_fps           = False
+        args.log_inference_fps = False
+
+# ── METRICS: validate that --csv-path is provided whenever any log flag is set ──
+any_logging = args.log_latency or args.log_inference_latency or \
+              args.log_fps or args.log_inference_fps
+if any_logging and not args.csv_path:
+    print('ERROR: --csv-path must be specified when any --log-* flag is set.')
+    sys.exit(1)
+
 # ---------------------------------------------------------------------------
 # Resolution / recording setup
 # ---------------------------------------------------------------------------
@@ -281,6 +339,62 @@ elif source_type == 'picamera':
     cap.start()
 
 # ---------------------------------------------------------------------------
+# METRICS: CSV setup
+# ---------------------------------------------------------------------------
+# We only open/create the CSV file if at least one logging flag is active.
+# The header row always includes 'timestamp', followed by whichever metric
+# columns the user enabled.
+
+csv_file    = None   # file handle, kept open for the duration of the loop
+csv_writer  = None   # csv.writer instance
+
+if any_logging:
+    # Build the list of column headers based on which flags are active.
+    # 'timestamp' is always first.
+    csv_columns = ['timestamp']
+    if args.log_latency:
+        csv_columns.append('end_to_end_latency_ms')
+    if args.log_inference_latency:
+        csv_columns.append('inference_latency_ms')
+    if args.log_fps:
+        csv_columns.append('end_to_end_fps')
+    if args.log_inference_fps:
+        csv_columns.append('inference_fps')
+
+    # Create parent directories if they don't exist, so the user can pass
+    # a path like /home/pi/logs/metrics.csv without needing to mkdir first.
+    csv_dir = os.path.dirname(args.csv_path)
+    if csv_dir and not os.path.exists(csv_dir):
+        os.makedirs(csv_dir, exist_ok=True)
+
+    csv_file   = open(args.csv_path, 'w', newline='')
+    csv_writer = csv.DictWriter(csv_file, fieldnames=csv_columns)
+    csv_writer.writeheader()
+    print(f'[INFO] Metrics CSV will be written to: {args.csv_path}')
+    print(f'[INFO] Logging will start after a 2-minute warm-up period.')
+
+# ── METRICS: warm-up timer — record the absolute time when the loop starts.
+# We will compare against this at every frame and skip logging for the
+# first 120 seconds (2 minutes).
+WARMUP_SECONDS = 120
+loop_start_time = None   # will be set on the very first iteration
+
+# ── METRICS: rolling windows for FPS calculation.
+# Each deque stores (wall_clock_timestamp, latency_seconds) for the last
+# `window_size` frames, separately tracked for e2e and inference.
+# When the deque reaches window_size entries, we can compute:
+#   FPS = window_size / (timestamp_of_last - timestamp_of_first)
+WINDOW_SIZE = args.frame_window_size
+
+# Deque of wall-clock timestamps (time.perf_counter) at the moment each
+# frame *completed* the e2e pipeline (just before cv2.imshow).
+e2e_window = deque(maxlen=WINDOW_SIZE)
+
+# Deque of wall-clock timestamps at the moment each frame *completed*
+# the ncnn forward pass.
+infer_window = deque(maxlen=WINDOW_SIZE)
+
+# ---------------------------------------------------------------------------
 # Inference loop
 # ---------------------------------------------------------------------------
 avg_frame_rate    = 0.0
@@ -288,8 +402,16 @@ frame_rate_buffer = []
 FPS_AVG_LEN       = 200
 img_count         = 0
 
-while True:
-    t_start = time.perf_counter()
+while not _shutdown_requested:
+    # ── METRICS: t_frame_start marks the very beginning of this frame's
+    # pipeline — immediately after we enter the loop, before any capture.
+    # This is the "start" timestamp for end-to-end latency.
+    t_frame_start = time.perf_counter()
+
+    # ── METRICS: record the absolute wall time for the first frame so we
+    # can track when the 2-minute warm-up period ends.
+    if loop_start_time is None:
+        loop_start_time = time.time()
 
     # --- Load frame ---------------------------------------------------------
     if source_type in ('image', 'folder'):
@@ -330,9 +452,20 @@ while True:
 
     # --- Inference ----------------------------------------------------------
     # create_extractor() is lightweight — a thin stateless view over the net
+
+    # ── METRICS: t_infer_start marks the beginning of the pure ncnn forward
+    # pass. We record this right before ex.input so the clock starts the
+    # moment we hand data to the network.
+    t_infer_start = time.perf_counter()
+
     with net.create_extractor() as ex:
-        ex.input("in0", mat_in)
-        _, out0 = ex.extract("out0")
+        ex.input("in0", mat_in)          # stage input tensor
+        _, out0 = ex.extract("out0")     # run forward pass — this is where the computation happens
+
+    # ── METRICS: t_infer_end marks the moment the ncnn forward pass is done.
+    # inference_latency_s = t_infer_end - t_infer_start
+    t_infer_end = time.perf_counter()
+    inference_latency_s = t_infer_end - t_infer_start
 
     # out0 is an ncnn.Mat; convert to numpy then reshape to (1, 4+nc, anchors)
     raw = np.array(out0).reshape(1, 4 + num_classes, -1)
@@ -370,29 +503,110 @@ while True:
     if dispW and dispH and (dispW != frame.shape[1] or dispH != frame.shape[0]):
         display_frame = cv2.resize(frame, (dispW, dispH))
 
+    # ── METRICS: t_frame_end marks the moment the fully-annotated frame is
+    # ready to be shown — right before cv2.imshow. This is the "end"
+    # timestamp for end-to-end latency.
+    t_frame_end = time.perf_counter()
+    e2e_latency_s = t_frame_end - t_frame_start
+
     cv2.imshow('YOLO11n NCNN', display_frame)
+
+    # --- Window-close and key handling --------------------------------------
+    wait_ms = 0 if source_type in ('image', 'folder') else 5
+    key = cv2.waitKey(wait_ms) & 0xFF
+
+    if key in (ord('q'), ord('Q')):
+        print('[INFO] Q pressed. Exiting.')
+        break
+    elif key in (ord('s'), ord('S')):
+        cv2.waitKey(0)
+    elif key in (ord('p'), ord('P')):
+        cv2.imwrite('capture.png', frame)
+        print('Saved capture.png')
+
+    # Check if the window was closed via the X button.
+    # WND_PROP_VISIBLE returns 0 or negative when the window is gone.
+    try:
+        if cv2.getWindowProperty('YOLO11n NCNN', cv2.WND_PROP_VISIBLE) < 1:
+            print('[INFO] Display window closed. Exiting.')
+            break
+    except cv2.error:
+        print('[INFO] Display window closed. Exiting.')
+        break
 
     if args.record:
         recorder.write(frame)
 
-    # --- Key handling -------------------------------------------------------
-    wait_ms = 0 if source_type in ('image', 'folder') else 5
-    key = cv2.waitKey(wait_ms)
-    if   key in (ord('q'), ord('Q')):   # quit
-        break
-    elif key in (ord('s'), ord('S')):   # pause / unpause
-        cv2.waitKey()
-    elif key in (ord('p'), ord('P')):   # screenshot
-        cv2.imwrite('capture.png', frame)
-        print('Saved capture.png')
-
-    # --- FPS bookkeeping ----------------------------------------------------
+    # --- FPS bookkeeping (original) -----------------------------------------
     t_stop  = time.perf_counter()
-    fps_now = 1.0 / max(t_stop - t_start, 1e-9)
+    fps_now = 1.0 / max(t_stop - t_frame_start, 1e-9)
     if len(frame_rate_buffer) >= FPS_AVG_LEN:
         frame_rate_buffer.pop(0)
     frame_rate_buffer.append(fps_now)
     avg_frame_rate = float(np.mean(frame_rate_buffer))
+
+    # ── METRICS: rolling window update ──────────────────────────────────────
+    # Push the wall-clock timestamp of this frame into each rolling window.
+    # We use time.perf_counter() so the timestamps are consistent with the
+    # latency values we already computed above.
+    current_perf = time.perf_counter()
+    e2e_window.append(current_perf)       # one entry per displayed frame
+    infer_window.append(t_infer_end)      # one entry per inferenced frame
+
+    # ── METRICS: compute rolling FPS once the window is full ────────────────
+    # FPS = number_of_frames / (timestamp_newest - timestamp_oldest)
+    # When the deque hits maxlen, the oldest entry is automatically dropped,
+    # so this always reflects the last `WINDOW_SIZE` frames.
+    e2e_fps   = None
+    infer_fps = None
+
+    if len(e2e_window) == WINDOW_SIZE:
+        elapsed_e2e = e2e_window[-1] - e2e_window[0]
+        if elapsed_e2e > 0:
+            # We have WINDOW_SIZE frames spanning elapsed_e2e seconds,
+            # so there are (WINDOW_SIZE - 1) intervals between them.
+            e2e_fps = (WINDOW_SIZE - 1) / elapsed_e2e
+
+    if len(infer_window) == WINDOW_SIZE:
+        elapsed_infer = infer_window[-1] - infer_window[0]
+        if elapsed_infer > 0:
+            infer_fps = (WINDOW_SIZE - 1) / elapsed_infer
+
+    # ── METRICS: CSV writing ─────────────────────────────────────────────────
+    # Only log after the 2-minute warm-up period has elapsed.
+    # We check this every frame, but writes only happen once warm-up is done.
+    if any_logging and csv_writer is not None:
+        elapsed_since_start = time.time() - loop_start_time
+
+        if elapsed_since_start >= WARMUP_SECONDS:
+            # Build the timestamp string in ISO-8601 format:
+            # e.g.  2025-07-15 14:32:07.413
+            # datetime.now() gives local time with microseconds; we format
+            # it to millisecond precision for readability.
+            ts = datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+
+            # Build the row dict; only include columns that were requested.
+            row = {'timestamp': ts}
+
+            if args.log_latency:
+                # Convert seconds → milliseconds and round to 3 decimal places
+                row['end_to_end_latency_ms'] = round(e2e_latency_s * 1000, 3)
+
+            if args.log_inference_latency:
+                row['inference_latency_ms'] = round(inference_latency_s * 1000, 3)
+
+            if args.log_fps:
+                # e2e_fps is None until the rolling window is full; write
+                # empty string in the meantime so the CSV stays well-formed.
+                row['end_to_end_fps'] = round(e2e_fps, 3) if e2e_fps is not None else ''
+
+            if args.log_inference_fps:
+                row['inference_fps'] = round(infer_fps, 3) if infer_fps is not None else ''
+
+            csv_writer.writerow(row)
+
+            # Flush every frame so data is not lost if the process is killed.
+            csv_file.flush()
 
 # ---------------------------------------------------------------------------
 # Cleanup
@@ -405,4 +619,10 @@ elif source_type == 'picamera':
     cap.stop()
 if args.record:
     recorder.release()
+
+# ── METRICS: close the CSV file handle cleanly on exit ──
+if csv_file is not None:
+    csv_file.close()
+    print(f'[INFO] Metrics saved to: {args.csv_path}')
+
 cv2.destroyAllWindows()

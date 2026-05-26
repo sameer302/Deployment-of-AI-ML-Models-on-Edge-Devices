@@ -4,6 +4,8 @@
     1) Raspberry Pi 5, 16GB RAM, SBC. [Product sheet](https://pip-assets.raspberrypi.com/categories/892-raspberry-pi-5/documents/RP-008348-DS-6-raspberry-pi-5-product-brief.pdf?disposition=inline)
     2) Arducam 5MP ov5647 camera module. [Product sheet.](https://docs.arducam.com/Raspberry-Pi-Camera/Native-camera/5MP-OV5647/#raspberry-pi-compute-module-3-4) 
     3) CSI ribbon to connect camera module with raspberry pi 5. 
+    4) 27W USB-C official raspberry pi 5 adapter and charger.
+    5) micro HDMI to HDMI cable to connect with display monitor. 
 
 - Here we have inference.py code files to run inference on raspberry pi 5 cpu using various model formats such as ncnn, onnx, pt, etc. 
 
